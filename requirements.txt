@@ -1,0 +1,5 @@
+numpy>=1.24
+
+# Optional - enables live synthesis of new discriminating questions with Claude
+# (the game falls back to crowd-sourcing questions from players without it):
+# anthropic>=0.40
