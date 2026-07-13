@@ -5,20 +5,36 @@ sure" when genuinely torn) and identifies it within 30 questions, guessing
 after at most 22, 26, and 30. Every question is chosen live to eliminate
 the maximum number of remaining candidates, drilling from sector level down
 to niche roles. If no existing question can split the leaders, the game
-synthesizes a brand-new discriminating question on the spot (Claude API,
-if available). Wrong three times -> it asks, learns, and never loses that
-occupation the same way again. The knowledge base is saved after every game.
+synthesizes a brand-new discriminating question on the spot.
+
+Wrong three times -> the game asks what the occupation was, but it does not
+take that claim on faith. It verifies the claim (does this occupation even
+exist, and how would a typical person in it answer every question the model
+tracks?) before writing anything to the knowledge base, and it never trusts
+the player's own in-game answers as ground truth for that write - only the
+independently-verified profile. See job_verification.py and
+engine.learn_verified for why. Question design is likewise never delegated
+back to the player: confused occupation pairs are auto-split by a
+synthesized question, not by asking "can you suggest one?".
+
+Verification requires `pip install google-genai` and a GEMINI_API_KEY
+environment variable (free tier works). Without it, an unverifiable claim is
+quarantined - held aside, never merged into the knowledge base - until you
+run with --reconcile once a key is available.
 
 Flags:
-  --reset     rebuild knowledge.json from the taxonomy + O*NET data
-  --stats     print knowledge-base statistics and exit
+  --reset       rebuild knowledge.json from the taxonomy + O*NET data
+  --stats       print knowledge-base statistics and exit
+  --reconcile   attempt to verify and learn everything in the pending queue
 """
 
 from __future__ import annotations
 
 import sys
+import time
 
 import engine
+import job_verification
 import question_gen
 from engine import ANSWER_WEIGHTS
 
@@ -109,79 +125,71 @@ def confirm_guess(game: engine.Game, label: str) -> tuple[bool, str]:
 
 
 def learn_true_career(kb: dict, game: engine.Game, wrong_guesses: list[str]) -> None:
-    """Get the real occupation from the player (resolving titles) and learn."""
+    """Get the claimed occupation from the player and verify it before
+    touching the knowledge base - never learn from the raw claim or from
+    the player's own in-game answers directly (see engine.learn_verified)."""
     name = ask("\nI give up! What is your occupation? > ")
     if not name:
         return
-    resolved, suggestion = engine.resolve_career(kb, name)
-    # Title data is noisy: confirm any match that isn't the occupation's own
-    # name before trusting it ("hacker" is a historical title for... forestry).
-    if resolved is not None and resolved != engine.normalize_name(name):
-        if not ask_yes_no(f'So your occupation is a kind of "{resolved}"?'):
-            resolved = None
-    if resolved is None and suggestion is not None:
-        if ask_yes_no(f'Is "{engine.normalize_name(name)}" a kind of "{suggestion}"?'):
-            engine.add_alias(kb, suggestion, name)
-            resolved = suggestion
-    true_career = resolved or engine.normalize_name(name)
-    is_new = resolved is None
 
-    pairs = engine.learn_from_game(kb, true_career, game.asked, wrong_guesses, won_round=0)
-    if is_new:
-        sector, field = kb["careers"][true_career]["path"]
-        print(f'New occupation "{true_career}" - filing it under '
-              f"{sector} > {field}. I will recognize it next time!")
-        offer_teach_mode(kb, true_career)
-    handle_discriminators(kb, pairs)
+    print("    Let me check that before I learn anything from it...")
+    verification = job_verification.verify_occupation(name, kb["questions"])
+    report = engine.learn_verified(kb, name, verification, game.asked, wrong_guesses)
+    render_verified_report(kb, name, report)
+    handle_discriminators(kb, report["confusions"])
 
 
-def offer_teach_mode(kb: dict, career: str) -> None:
-    """Fill profile gaps so a new occupation competes fairly in future games."""
-    qids = engine.teaching_questions(kb, career, limit=10)
-    if len(qids) < 3:
+def render_verified_report(kb: dict, claimed_name: str, report: dict) -> None:
+    if report["status"] == "quarantined":
+        print("  I couldn't verify this occupation right now (no GEMINI_API_KEY "
+              "set, or the lookup failed), so I'm holding it aside without "
+              "touching my knowledge base. Run `python play.py --reconcile` "
+              "once verification is available to let me learn it properly.")
         return
-    print(f'\nMy picture of "{career}" still has gaps.')
-    if not ask_yes_no(f"Answer {len(qids)} quick extra questions so I learn it properly?"):
+
+    if report["status"] == "rejected":
+        print(f'  I couldn\'t confirm "{engine.normalize_name(claimed_name)}" is a '
+              "real, distinct occupation, so I'm not adding it - that would just "
+              "teach myself bad information.")
         return
-    answers = {}
-    for i, qid in enumerate(qids, 1):
-        answers[qid] = ask_answer(i, kb["questions"][qid]["text"])
-    engine.teach_career(kb, career, answers)
-    print("Thanks - profile completed.")
+
+    if report["disagreements"]:
+        print(f"  (Note: {report['disagreements']} of your answers this game didn't "
+              "match how a typical person in this role usually responds. I'm "
+              "learning from the verified profile instead of your raw answers, "
+              "so this won't corrupt my knowledge base.)")
+
+    if report["is_new"]:
+        sector, field = kb["careers"][report["career"]]["path"]
+        print(f'  New occupation verified and learned: "{report["career"]}" '
+              f"- filed under {sector} > {field}. I will recognize it next time!")
+        if report["definition"]:
+            print(f'  {report["definition"]}')
+    else:
+        print(f'  Verified and reinforced my existing knowledge of '
+              f'"{report["career"]}".')
 
 
 def handle_discriminators(kb: dict, pairs: list[tuple[str, str]]) -> None:
-    """For each confused pair, mint a new question (LLM first, then player)."""
+    """For each confused pair, synthesize a discriminating question ourselves
+    from verified facts (Gemini, then Claude as fallback) - no player
+    round-trip. A question the player invented is exactly the kind of
+    unverified input this whole module exists to avoid."""
     for true_career, guessed in pairs:
-        print(f'\nI keep mixing up "{true_career}" and "{guessed}" - '
-              "let me learn a question that tells them apart.")
+        print(f'\n  Learning to tell "{true_career}" and "{guessed}" apart...')
         existing = [q["text"] for q in kb["questions"].values()]
-        gen = question_gen.generate_discriminator(true_career, guessed, existing)
-
+        gen = job_verification.synthesize_discriminator(true_career, guessed, existing)
+        if gen is None:
+            gen = question_gen.generate_discriminator(true_career, guessed, existing)
         if gen and not engine.question_already_exists(kb, gen["question"]):
-            print(f'  Generated: "{gen["question"]}"')
-            print(f'  ({true_career}: {gen["answer_for_career_a"]}, '
-                  f'{guessed}: {gen["answer_for_career_b"]})')
-            if ask_yes_no("  Does that look like a fair question?"):
-                engine.add_question(kb, gen["question"], "llm", {
-                    true_career: ANSWER_WEIGHTS[gen["answer_for_career_a"]],
-                    guessed: ANSWER_WEIGHTS[gen["answer_for_career_b"]],
-                })
-                print("  Learned. I will use it in future games.")
-                continue
-
-        print("  Can you suggest a yes/no question that separates them?")
-        text = ask("  Question (or press Enter to skip) > ")
-        if not text:
-            continue
-        if engine.question_already_exists(kb, text):
-            print("  I already have a very similar question - skipping.")
-            continue
-        ans = "yes" if ask_yes_no(f'  For a "{true_career}", is the answer yes?') else "no"
-        seed = {true_career: ANSWER_WEIGHTS[ans],
-                guessed: ANSWER_WEIGHTS["no" if ans == "yes" else "yes"]}
-        engine.add_question(kb, text, "user", seed)
-        print("  Learned. I will use it in future games.")
+            engine.add_question(kb, gen["question"], "auto", {
+                true_career: ANSWER_WEIGHTS[gen["answer_for_career_a"]],
+                guessed: ANSWER_WEIGHTS[gen["answer_for_career_b"]],
+            })
+            print(f'  Learned: "{gen["question"]}"')
+        else:
+            print("  (Couldn't synthesize a good discriminator this time - "
+                  "I'll try again after more games.)")
 
 
 def play_one_game(kb: dict) -> None:
@@ -215,15 +223,51 @@ def print_stats(kb: dict) -> None:
     total = max(1, s["games"])
     sectors = {c["path"][0] for c in kb["careers"].values()}
     aliases = sum(len(c["aliases"]) for c in kb["careers"].values())
+    pending = len(kb.get("pending_review", []))
     print(f"Games played:        {s['games']}")
     print(f"Won on guess 1/2/3:  {s['wins_first']} / {s['wins_second']} / "
           f"{s.get('wins_third', 0)}"
           f"  ({(s['wins_first'] + s['wins_second'] + s.get('wins_third', 0)) / total:.0%} overall)")
     print(f"Lost (then learned): {s['losses']} ({s['losses'] / total:.0%})")
+    print(f"Verified learns:     {s.get('verified_learns', 0)}")
+    print(f"Rejected (not real): {s.get('rejected_unreal', 0)}")
+    print(f"Pending verification:{pending:>4} (run --reconcile once GEMINI_API_KEY is set)")
     print(f"Occupations known:   {len(kb['careers'])} across {len(sectors)} sectors")
     print(f"Job titles known:    {aliases + len(kb['careers'])} (incl. aliases)")
     learned_q = sum(1 for q in kb["questions"].values() if q["source"] != "seed")
     print(f"Questions known:     {len(kb['questions'])} ({learned_q} learned)")
+
+
+def cmd_reconcile(kb: dict, limit: int = 15) -> None:
+    """Retry verification for everything quarantined by learn_true_career,
+    capped per run to stay polite to the free-tier rate limit."""
+    pending = kb.get("pending_review", [])
+    if not pending:
+        print("Nothing pending - every claim has already been resolved.")
+        return
+    batch = pending[:limit]
+    print(f"Reconciling {len(batch)} of {len(pending)} pending claim(s)...")
+    remaining = pending[limit:]
+    resolved = 0
+    for i, item in enumerate(batch):
+        title = item["claimed_title"]
+        print(f'\n  [{i + 1}/{len(batch)}] Verifying "{title}"...')
+        verification = job_verification.verify_occupation(title, kb["questions"])
+        asked = [tuple(pair) for pair in item["asked"]]
+        report = engine.learn_verified(kb, title, verification, asked,
+                                       item["wrong_guesses"])
+        render_verified_report(kb, title, report)
+        if report["status"] == "quarantined":
+            remaining.append(item)
+        else:
+            resolved += 1
+            if report["status"] == "learned":
+                handle_discriminators(kb, report["confusions"])
+        if i < len(batch) - 1:
+            time.sleep(1.5)  # be gentle with the free tier
+    kb["pending_review"] = remaining
+    engine.save_kb(kb)
+    print(f"\nDone. {resolved} resolved, {len(remaining)} still pending.")
 
 
 def main() -> None:
@@ -234,6 +278,9 @@ def main() -> None:
     kb = engine.load_kb()
     if "--stats" in sys.argv:
         print_stats(kb)
+        return
+    if "--reconcile" in sys.argv:
+        cmd_reconcile(kb)
         return
 
     print("=" * 64)

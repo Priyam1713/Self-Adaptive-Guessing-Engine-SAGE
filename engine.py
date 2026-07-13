@@ -137,12 +137,14 @@ def build_seed_kb() -> dict:
 
     _attach_priors(careers)
     return {
-        "version": 3,
+        "version": 4,
         "stats": {"games": 0, "wins_first": 0, "wins_second": 0,
-                  "wins_third": 0, "losses": 0},
+                  "wins_third": 0, "losses": 0, "verified_learns": 0,
+                  "rejected_unreal": 0},
         "questions": questions,
         "careers": careers,
         "confusions": {},
+        "pending_review": [],
     }
 
 
@@ -211,7 +213,7 @@ def load_kb(path: str = KB_PATH) -> dict:
     if os.path.exists(path):
         with open(path, "r", encoding="utf-8") as f:
             kb = json.load(f)
-        if kb.get("version") == 3:
+        if kb.get("version") == 4:
             return kb
     kb = build_seed_kb()
     save_kb(kb, path)
@@ -579,6 +581,103 @@ def learn_from_game(kb: dict, true_career: str, asked: list[tuple[str, float]],
         if kb["confusions"][pair] >= 2 or profile_distance(kb, true_career, guessed) < CONFUSION_DISTANCE:
             needs_discriminator.append((true_career, guessed))
     return needs_discriminator
+
+
+def queue_pending(kb: dict, claimed_title: str, asked: list[tuple[str, float]],
+                  wrong_guesses: list[str]) -> None:
+    """Park an unverifiable claim without touching the knowledge base.
+
+    Used when verification is unavailable (no API key, network/API error) -
+    see learn_verified. Never silently trusted; only merged in once a real
+    verification call succeeds (job_verification.verify_occupation via
+    `python play.py --reconcile`).
+    """
+    kb.setdefault("pending_review", []).append({
+        "claimed_title": normalize_name(claimed_title),
+        "asked": [list(pair) for pair in asked],
+        "wrong_guesses": [normalize_name(w) for w in wrong_guesses],
+    })
+
+
+def apply_sector_hint(kb: dict, career: str, hint: str | None) -> None:
+    """Reclassify a newly learned occupation's sector using a verified hint,
+    matched against sectors that already exist in the hierarchy."""
+    if not hint:
+        return
+    career = normalize_name(career)
+    if career not in kb["careers"]:
+        return
+    sectors = sorted({c["path"][0] for c in kb["careers"].values()})
+    hint_norm = hint.strip().lower()
+    match = next((s for s in sectors if s.lower() == hint_norm), None)
+    if match is None:
+        close = get_close_matches(hint_norm, [s.lower() for s in sectors], n=1, cutoff=0.55)
+        if close:
+            match = next(s for s in sectors if s.lower() == close[0])
+    if match:
+        kb["careers"][career]["path"][0] = match
+
+
+def learn_verified(kb: dict, claimed_title: str, verification: dict | None,
+                   asked: list[tuple[str, float]], wrong_guesses: list[str],
+                   won_round: int = 0) -> dict:
+    """Apply a job_verification.verify_occupation() result to the knowledge
+    base - or refuse to, if it isn't trustworthy yet.
+
+    This is the fix for two trust gaps in "lost -> ask -> believe": (1) the
+    claimed occupation might not exist, and (2) the player's own answers
+    during the game are never taken as ground truth for what gets written to
+    the knowledge base - only the verified, independently-grounded profile
+    is. `asked` still contributes exactly one thing: a disagreement count
+    against the grounded profile, surfaced to the caller for transparency.
+
+    verification=None means "couldn't verify" (not "not real") - the claim
+    is quarantined via queue_pending, never merged, never rejected outright.
+
+    Returns {"status": "learned"|"rejected"|"quarantined", "career": str|None,
+    "definition": str|None, "disagreements": int, "confusions": [...],
+    "is_new": bool}.
+    """
+    claimed_title = normalize_name(claimed_title)
+
+    if verification is None:
+        queue_pending(kb, claimed_title, asked, wrong_guesses)
+        return {"status": "quarantined", "career": None, "definition": None,
+                "disagreements": 0, "confusions": [], "is_new": False}
+
+    if not verification.get("is_real_occupation"):
+        kb["stats"]["rejected_unreal"] = kb["stats"].get("rejected_unreal", 0) + 1
+        return {"status": "rejected", "career": None, "definition": None,
+                "disagreements": 0, "confusions": [], "is_new": False}
+
+    canonical = normalize_name(verification.get("canonical_title") or claimed_title)
+    resolved, _ = resolve_career(kb, canonical)
+    if resolved is None:
+        resolved, _ = resolve_career(kb, claimed_title)
+    true_career = resolved or canonical
+    is_new = true_career not in kb["careers"]
+
+    grounded: dict[str, str] = verification.get("answers", {})
+    informative = [(qid, w) for qid, w in asked if w != 0.5]
+    disagreements = sum(
+        1 for qid, w in informative
+        if grounded.get(qid) in ("yes", "no")
+        and abs(ANSWER_WEIGHTS[grounded[qid]] - w) >= 1.0
+    )
+    grounded_asked = [(qid, ANSWER_WEIGHTS[a]) for qid, a in grounded.items()
+                      if qid in kb["questions"] and a in ANSWER_WEIGHTS]
+
+    pairs = learn_from_game(kb, true_career, grounded_asked, wrong_guesses, won_round)
+    add_alias(kb, true_career, claimed_title)
+    if canonical != true_career:
+        add_alias(kb, true_career, canonical)
+    if is_new:
+        apply_sector_hint(kb, true_career, verification.get("sector_hint"))
+
+    kb["stats"]["verified_learns"] = kb["stats"].get("verified_learns", 0) + 1
+    return {"status": "learned", "career": true_career,
+            "definition": verification.get("definition"),
+            "disagreements": disagreements, "confusions": pairs, "is_new": is_new}
 
 
 def question_spread(kb: dict, qid: str) -> float:

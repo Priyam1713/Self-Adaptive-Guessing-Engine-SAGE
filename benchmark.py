@@ -28,20 +28,6 @@ SEED = 42
 FULL_BUDGET = engine.ROUND_LIMITS[-1]   # questions counted for a lost game
 
 
-def _ensure_engine_ready() -> None:
-    """Guard against an in-progress edit of engine.py.
-
-    engine.build_seed_kb() currently calls the module-private hook
-    _attach_priors(), which may not yet be defined while priors are still
-    being wired up. We do NOT edit engine.py; instead, only when that symbol
-    is missing, we supply a no-op so the KB still builds. The result is a KB
-    with no "prior" fields, which the report already handles (weighted stats
-    equal unweighted). Once engine.py defines the real function, it wins.
-    """
-    if not hasattr(engine, "_attach_priors"):
-        engine._attach_priors = lambda careers: None
-
-
 # ---------------------------------------------------------------- one game
 
 def play_one(kb: dict, name: str, rng: random.Random) -> dict:
@@ -209,7 +195,6 @@ def main() -> None:
                         help="print a line per game")
     args = parser.parse_args()
 
-    _ensure_engine_ready()
     kb = engine.build_seed_kb()
     names = list(kb["careers"])
     if args.limit is not None:

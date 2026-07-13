@@ -1,5 +1,14 @@
 numpy>=1.24
 
-# Optional - enables live synthesis of new discriminating questions with Claude
-# (the game falls back to crowd-sourcing questions from players without it):
+# Optional - enables verification of claimed occupations after a loss (does
+# it exist, and how would a typical person in it answer every question SAGE
+# tracks?) plus autonomous discriminator-question synthesis. Without this,
+# unverifiable claims are quarantined (see job_verification.py, README).
+# Free tier: get a key at https://aistudio.google.com/apikey, then
+#   set GEMINI_API_KEY=your-key   (never commit it - see README)
+# google-genai>=1.0
+# pydantic>=2.0
+
+# Optional - secondary fallback for discriminator-question synthesis if
+# Gemini is unavailable (the game still works without either):
 # anthropic>=0.40

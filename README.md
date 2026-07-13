@@ -7,24 +7,37 @@ Think of any job — *propulsion engineer*, *actuary*, *air traffic controller*,
 it with **simple yes/no questions** (say "not sure" only when genuinely torn).
 The first identification comes within **15 questions worst case** — common
 occupations in 6–8, ~10 on average for a random worker — with recovery guesses
-at 22 and 30 for the hard tail. Wrong three times? It asks, learns, and never
-loses that job the same way again.
+at 22 and 30 for the hard tail. Wrong three times? It asks what the job was —
+but it doesn't just believe you. See [Trust](#trust-verifying-before-learning)
+below for why, and how it learns without ever corrupting itself.
 
 ## Run it
 
 ```
 pip install -r requirements.txt   # numpy is the only hard dependency
-python play.py           # play (creates knowledge.json on first run)
-python play.py --stats   # knowledge-base statistics
-python play.py --reset   # rebuild knowledge.json from taxonomy + O*NET data
-python simulate.py       # automated verification of the whole loop
-python benchmark.py      # measure questions-to-guess across all occupations
-python onet_import.py    # (optional) re-import the O*NET database
+python play.py               # play (creates knowledge.json on first run)
+python play.py --stats       # knowledge-base statistics
+python play.py --reset       # rebuild knowledge.json from taxonomy + O*NET data
+python play.py --reconcile   # verify + learn everything currently quarantined
+python simulate.py           # automated verification of the whole loop (offline)
+python benchmark.py          # measure questions-to-guess across all occupations
+python onet_import.py        # (optional) re-import the O*NET database
 ```
 
-Optionally, `pip install anthropic` + an `ANTHROPIC_API_KEY` enables live
-question synthesis with Claude; without it the game crowd-sources new
-questions from players instead.
+Optionally:
+
+- `pip install google-genai pydantic` + a `GEMINI_API_KEY` env var (free tier)
+  enables **verification** of claimed occupations after a loss — get a key at
+  [aistudio.google.com/apikey](https://aistudio.google.com/apikey). Without
+  it, unverifiable claims are quarantined rather than learned (see below) —
+  the game still plays fine, it just won't grow from losses until you run
+  `--reconcile` with a key set.
+- `pip install anthropic` + an `ANTHROPIC_API_KEY` is used as a secondary
+  fallback for discriminator-question synthesis if Gemini is unavailable.
+
+**Never commit an API key.** Set it as an environment variable
+(`GEMINI_API_KEY`, `ANTHROPIC_API_KEY`) — nothing in this repo reads keys from
+a file, and none should ever be hardcoded into source.
 
 ## Coverage — how "56 million titles" really works
 
@@ -102,11 +115,16 @@ onet_data.json  the imported O*NET layer (rebuildable offline)
 employment.json BLS OEWS May 2024 national employment per SOC code (priors)
 engine.py       numpy-vectorized Bayesian survivor tracking + live
                 decision-tree computation, employment priors + annealing,
-                all learning updates
+                verified learning (learn_verified), pending-claim quarantine
+job_verification.py  Gemini-powered occupation verification: existence,
+                definition, and a full grounded answer profile - independent
+                of anything the player typed during the game
 play.py         game loop: elimination display, sector narrowing, guessing,
-                mid-game question synthesis, teach mode
-question_gen.py Claude-powered generation of discriminating questions
-simulate.py     automated self-tests
+                mid-game question synthesis, verify-before-learn flow,
+                --reconcile for the quarantine queue
+question_gen.py Claude-powered fallback for discriminator-question synthesis
+simulate.py     automated self-tests (fully offline - verification is tested
+                against a hand-built result, not a live API call)
 benchmark.py    measurement harness: questions-to-guess distributions
 knowledge.json  the living model - updated after every game
 ```
@@ -149,14 +167,58 @@ information; they unfold the moment a discriminating question is minted.
 
 - Guess right → the occupation's cells shift toward the answers given
   (counts are capped, so beliefs drift with the world rather than fossilize).
-- Wrong three times → the game asks. Known titles resolve through the alias
-  corpus (with confirmation); unknown occupations are imprinted from the
-  game's answers, placed next to their nearest neighbor in the hierarchy,
-  and teach mode fills their profile gaps.
+- Wrong three times → the game asks what the job was, then **verifies it**
+  before writing anything — see [Trust](#trust-verifying-before-learning).
 - Repeatedly confused pairs — or a mid-game stall where no existing question
-  splits the leaders — trigger **question synthesis**: Claude (or the player)
-  supplies a new discriminating question that deploys itself at exactly the
-  right depth in future games.
+  splits the leaders — trigger **question synthesis**: the model derives a
+  new discriminating question itself (Gemini, then Claude as fallback) from
+  verified facts about both occupations. No player round-trip; a question the
+  player invented is exactly the kind of unverified input the trust layer
+  exists to avoid.
+
+## Trust: verifying before learning
+
+An earlier version of this loop was "lost → ask the player → believe them" —
+three separate ways that breaks:
+
+1. **Existence.** Nothing confirmed the claimed job was real. A typo, a
+   joke, or a vague non-answer ("stuff") would still get written to the
+   knowledge base as a genuine occupation.
+2. **Answer honesty.** The player's answers *during the game* were trusted
+   as ground truth for updating that occupation's profile — with no check
+   that they'd actually answered the way a real person in that job would.
+   One confused or dishonest playthrough could quietly corrupt an
+   occupation's beliefs, including *existing* ones.
+3. **Question design delegated to the least reliable source.** When two
+   occupations were confused, the game asked the *player* to invent a
+   discriminating question — the model outsourcing its own curation.
+
+`job_verification.py` (Gemini, structured JSON output) closes all three with
+one call per lost game: it decides whether the claim names a real occupation,
+returns its canonical title and definition, and — independently of anything
+the player answered — states how a *typical* person in that role would
+answer every question SAGE tracks. `engine.learn_verified` then:
+
+- **Rejects** claims Gemini can't confirm are real occupations. Nothing is
+  written.
+- **Quarantines** claims it can't verify at all (no API key, network/API
+  error) into `kb["pending_review"]` — held aside, never merged, until
+  `python play.py --reconcile` succeeds later. Unverifiable is not the same
+  as false; it's just not yet trusted.
+- **Learns from the grounded profile, never the player's raw answers.** The
+  session's answers are used for exactly one thing: counting how many
+  disagreed with the grounded profile, surfaced back to the player for
+  transparency. A fabricated "yes" during the game cannot move a cell toward
+  "yes" — proven in `simulate.py` TEST 6(c), where a nurse's `code` belief
+  stayed near 0 even though the simulated session answered `code: yes`.
+- **Canonicalizes before creating a duplicate**: the verified title is
+  re-checked against the occupation hierarchy (catching synonyms the static
+  alias corpus missed — Gemini correctly folded "librarian assistant" into
+  the existing O*NET occupation "library assistants, clerical" in testing)
+  before deciding an occupation is genuinely new.
+
+`--reconcile` batches through the pending queue with a short delay between
+calls, capped per run, to stay inside the free tier.
 
 ## Verified behavior (`python simulate.py`, `python benchmark.py`)
 
@@ -169,9 +231,15 @@ information; they unfold the moment a discriminating question is minted.
 | Learn unknown occupation | added + placed in hierarchy; first-guess wins in all following games |
 | Discriminator question for a manufactured twin pair | both separated, first guess |
 | Typo / title-alias resolution | pass |
+| Verification integrity (unverifiable → quarantined, not-real → rejected, fabricated session answers → not learned, verified-new → learned + sector-filed) | 4/4 pass, offline |
 
-End-to-end CLI check: "astronaut" (absent from O*NET) taught in one session
-was first-guessed by a fresh process in the next.
+End-to-end CLI check (live Gemini calls): an adversarial player who answered
+every question "no" was correctly guessed wrong three times, then claimed "air
+traffic controller" — the game flagged that 12 of 30 answers didn't match a
+real ATC's typical responses, learned from the verified profile instead, and
+autonomously synthesized three discriminating questions with zero player
+prompts. Separately, "astronaut" (absent from O*NET) verified and learned in
+one session was first-guessed by a fresh process in the next.
 
 *Honest caveat*: those numbers are against simulated players answering
 consistently with the knowledge base. Real people answer noisily — that is

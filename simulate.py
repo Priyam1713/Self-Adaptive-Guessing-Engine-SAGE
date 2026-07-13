@@ -8,8 +8,15 @@ Simulates players whose answers come from a hidden occupation profile:
   3. Learning new occupations: an unknown job is taught once, then guessed.
   4. Mistake-driven questions: a confusable pair gets a discriminator.
   5. Name resolution: typos and aliases.
+  6. Verification integrity: unverifiable claims are quarantined, claims
+     verified as not real are rejected, and the knowledge base only ever
+     learns from a verified profile - never from the player's raw in-game
+     answers, even when they're fabricated.
 
-No API key needed - question generation is stubbed where exercised.
+No API key needed - question generation is stubbed where exercised, and the
+verification pipeline (engine.learn_verified) is exercised with a hand-built
+result dict rather than a live job_verification.verify_occupation() call, so
+this file stays fully offline.
 """
 
 from __future__ import annotations
@@ -186,6 +193,77 @@ def test_alias_and_fuzzy() -> None:
     print("  PASS\n")
 
 
+def test_verification_integrity() -> None:
+    """engine.learn_verified never trusts an unverified claim or the
+    player's raw in-game answers - only a verification result decides what
+    (if anything) gets written to the knowledge base. See job_verification.py
+    for how that result is produced live; here it's hand-built so the test
+    needs no network access."""
+    print("TEST 6: verification integrity (existence, answer honesty, no learning without proof)")
+    kb = engine.build_seed_kb()
+
+    # (a) No verification available -> quarantined, nothing touches "careers".
+    n_before = len(kb["careers"])
+    report = engine.learn_verified(kb, "underwater basket weaver", None,
+                                   [("code", 0.0)], [])
+    assert report["status"] == "quarantined"
+    assert len(kb["careers"]) == n_before
+    assert len(kb["pending_review"]) == 1
+    print("  (a) unverifiable claim -> quarantined, careers untouched: PASS")
+
+    # (b) Verification says "not real" -> rejected outright, nothing queued.
+    report = engine.learn_verified(kb, "flibbertigibbet moon wizard",
+                                   {"is_real_occupation": False, "canonical_title": "",
+                                    "definition": "", "sector_hint": "", "answers": {}},
+                                   [], [])
+    assert report["status"] == "rejected"
+    assert len(kb["careers"]) == n_before
+    print("  (b) claim verified as not real -> rejected, careers untouched: PASS")
+
+    # (c) Verified real, but the player's raw session answers are fabricated
+    # (opposite of the grounded truth) - the KB must learn from the grounded
+    # profile, not the fabricated one.
+    before_p = engine.p_yes(kb, "registered nurse", "code")  # near 0: nurses don't code
+    fabricated_asked = [("code", 1.0), ("aircraft", 1.0)]  # both wrong for a nurse
+    verification = {
+        "is_real_occupation": True,
+        "canonical_title": "registered nurse",
+        "definition": "Provides and coordinates patient care.",
+        "sector_hint": "healthcare & medicine",
+        "answers": {"code": "no", "aircraft": "no", "healthcare": "yes"},
+    }
+    report = engine.learn_verified(kb, "registered nurse", verification,
+                                   fabricated_asked, [])
+    assert report["status"] == "learned" and report["is_new"] is False
+    assert report["disagreements"] == 2, report["disagreements"]
+    after_p = engine.p_yes(kb, "registered nurse", "code")
+    assert after_p <= before_p + 0.05, (
+        f"fabricated 'yes' answer leaked into the knowledge base "
+        f"(p(code) {before_p:.3f} -> {after_p:.3f})")
+    print(f"  (c) fabricated answers detected (disagreements=2) and NOT learned; "
+          f"p(code=yes) stayed near {after_p:.3f} instead of rising toward the fake 'yes': PASS")
+
+    # (d) Verified real + genuinely new -> added, filed under the hinted
+    # sector, aliased under both the claimed and canonical spelling. Name
+    # chosen to be certain it collides with nothing in O*NET's ~33k aliases
+    # (e.g. "lighthouse keeper" is already an alias of an existing O*NET
+    # occupation - resolve_career would correctly fold it in, not add it).
+    verification = {
+        "is_real_occupation": True,
+        "canonical_title": "quantum flux calibration technician",
+        "definition": "Calibrates quantum flux containment arrays.",
+        "sector_hint": "transport & logistics",
+        "answers": {"ships": "yes", "code": "no", "shifts": "yes"},
+    }
+    report = engine.learn_verified(kb, "Quantum Flux Calibrator", verification, [], [])
+    assert report["status"] == "learned" and report["is_new"] is True
+    assert report["career"] == "quantum flux calibration technician"
+    assert kb["careers"][report["career"]]["path"][0] == "transport & logistics"
+    print("  (d) new occupation learned only from the grounded profile, "
+          "sector hint applied: PASS")
+    print("  PASS\n")
+
+
 if __name__ == "__main__":
     strict = "--report" not in sys.argv
     test_accuracy(strict=strict)
@@ -194,4 +272,5 @@ if __name__ == "__main__":
         test_learn_new_career()
         test_discriminator_question()
         test_alias_and_fuzzy()
+        test_verification_integrity()
         print("All simulation tests passed.")
