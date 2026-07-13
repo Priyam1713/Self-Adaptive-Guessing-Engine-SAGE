@@ -1,6 +1,6 @@
 """Generate new discriminating questions when the model confuses two careers.
 
-Primary path: ask Claude for a yes/no question that splits the confused pair,
+Primary path: ask the LLM for a yes/no question that splits the confused pair,
 with structured JSON output so the answer plugs straight into the knowledge
 base. Requires the `anthropic` package and API credentials; if either is
 missing (or the call fails) the caller falls back to asking the player for a
